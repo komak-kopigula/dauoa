@@ -1026,6 +1026,21 @@ def _append_kline_from_ws(symbol, k):
         _log_err(f"append_kline_{symbol}", e)
 
 
+def bootstrap_all_klines(syms):
+    """Bootstrap 5m history for all paper-trading symbols using public market data only."""
+    print(f"  📥 Bootstrap history awal ({len(syms)} simbol) via LIVE REST — paced/anti-403...")
+    ok = 0
+    for i, s in enumerate(syms, 1):
+        try:
+            if _bootstrap_klines(s, Client.KLINE_INTERVAL_5MINUTE, 100) is not None:
+                ok += 1
+        except Exception as e:
+            _log_err(f"bootstrap_all_{s}", e, cooldown=30)
+        if i < len(syms):
+            time.sleep(REST_MIN_INTERVAL)
+    print(f"  ✅ Bootstrap selesai: {ok}/{len(syms)} simbol siap dipantau")
+
+
 def ohlcv(symbol, interval, limit=100):
     with _kline_lock:
         df = _kline_cache.get(symbol)
