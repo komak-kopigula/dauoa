@@ -6,3 +6,4 @@ ta
 pandas
 requests
 numpy
+scikit-learn
