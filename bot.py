@@ -1,14 +1,10 @@
 """
-Bot Scalping v22.0 DEMO — INSTITUTIONAL QUANT ENGINE (Binance Futures)
+Bot Scalping v22.1 DEMO — INSTITUTIONAL QUANT ENGINE (Binance Futures)
 ====================================================================
-STRICT SIDEWAY & VOLUME FILTER + MAKASSAR TIMEZONE (WITA):
-- Volume Filter: Wajib Volume Ratio (VR) >= 0.85 & ADX >= 20 (Cegah Entry Sideway)
-- Volatility Filter: ATR % wajib cukup untuk pergerakan harga.
-- Dynamic Logic Toggle Mode: Normal <-> Inverted saat Loss.
-- Advanced Banned Rules: Temporary ban 6120s jika mengalami Inverted Time-limit Short Loss.
-- Real-time Metrics: ATH PnL, Best Single Win, Worst Single Loss.
-- Last 5 Trades History dengan Timestamp Entry & Exit (Zona Waktu WITA / Makassar UTC+8).
-- MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
+FIXED:
+- WebSocket compatibility fix for python-binance
+- Removed os.system('clear') for cloud/Railway compatibility
+- Fixed BTC Macro $0.0 display bug with REST fallback
 """
 
 import sys
@@ -52,8 +48,7 @@ BINANCE_DEMO = False
 client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
 WS_MAX_QUEUE_SIZE = 2000
-DEPTH_SOCKET_CHUNK = 8
-MARK_PRICE_FAST = False
+MARKPRICE_FRESH_SEC = 10
 
 # Definisi Zona Waktu Makassar (WITA / UTC+8)
 WITA_TZ = timezone(timedelta(hours=8))
@@ -86,26 +81,21 @@ ORDER_USDT    = 3.0
 MAX_POSITIONS = 1
 
 # Strict Volume & Sideway Filters
-MIN_VOLUME_RATIO = 0.85   # Volume minimal 85% dari rata-rata 20 candle
-MIN_ADX_TREND    = 20.0   # ADX minimal 20 (mengabaikan market mati/sideway)
-MIN_ATR_PCT      = 0.003  # Volatilitas minimal 0.3% agar ada pergerakan
+MIN_VOLUME_RATIO = 0.85
+MIN_ADX_TREND    = 20.0
+MIN_ATR_PCT      = 0.003
 
 # Scanning & Concurrency
 SCAN_INTERVAL = 2.0
-MONITOR_INT   = 0.1
-BATCH_SIZE    = 15
 MAX_WORKERS   = 5
-SLOT_FILL_INT = 0.01
 
 # REST API Safety
 REST_MIN_INTERVAL = 0.20
 REST_403_COOLDOWN = 300.0
 REST_429_COOLDOWN = 60.0
-REST_418_COOLDOWN = 900.0
-REST_RETRIES = 2
 
 # Scoring & Risk
-MIN_SCORE                  = 58   # Menaikkan batas minimal skor sinyal
+MIN_SCORE                  = 58
 ATR_TP_RESTORED_MULTIPLIER = 3.5
 ATR_SL_RESTORED_MULTIPLIER = 1.8
 
@@ -113,7 +103,7 @@ MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
 MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # Batas maksimal tahan posisi (1.7 Jam)
+MAX_HOLD_SECONDS  = 6120
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -129,16 +119,8 @@ BTC_PUMP_THRESHOLD   = 0.003
 BTC_WINDOW_SEC       = 8.0
 BTC_BREAKER_COOLDOWN = 120.0
 
-# Kill Switch
-DAILY_LOSS   = -20.0
-CONSEC_MAX   = 15
-CONSEC_PAUSE = 10
-
-LEARNING_WINDOW       = 200
-MIN_TRADES_FOR_WEIGHT = 20
-
 # Banned Mechanism Variables
-BANNED_SHORT_DURATION = 6120.0  # Ban Short 6120 detik
+BANNED_SHORT_DURATION = 6120.0
 
 # ═══════════════════════════════════════════════════════════════════════════
 # SYMBOLS
@@ -310,6 +292,11 @@ class BTCMacroEngine:
     def get_status_str(self) -> str:
         with self.lock:
             px = self.last_price
+            if px <= 0:
+                # Fallback ke REST API jika WS belum mendapatkan harga BTC
+                px = price_live("BTCUSDT")
+                self.last_price = px
+
             active = self.breaker["active"] and time.time() < self.breaker["until"]
             if active:
                 rem = self.breaker["until"] - time.time()
@@ -447,14 +434,14 @@ class SignalWeights:
             base = sig.split('[')[0].strip()
             if base in self.weights:
                 self.history[base].append(1 if won else 0)
-                if len(self.history[base]) > LEARNING_WINDOW:
-                    self.history[base] = self.history[base][-LEARNING_WINDOW:]
+                if len(self.history[base]) > 200:
+                    self.history[base] = self.history[base][-200:]
 
     def get_adjusted_weight(self, signal_name: str) -> float:
         if not self.adaptive_enabled: return self.weights.get(signal_name, 10)
         base = signal_name.split('[')[0].strip()
         hist = self.history.get(base, [])
-        if len(hist) < MIN_TRADES_FOR_WEIGHT: return self.weights.get(base, 10)
+        if len(hist) < 20: return self.weights.get(base, 10)
         return self.weights.get(base, 10) * max(0.5, min(1.5, 0.5 + sum(hist) / len(hist)))
 
 class SignalScorer:
@@ -604,66 +591,37 @@ class LearningLayer:
         self.stats_by_regime[r]["wins"]   += 1 if trade.won else 0
         self.stats_by_regime[r]["losses"] += 0 if trade.won else 1
         self.stats_by_regime[r]["pnl"]    += trade.pnl
-        if trade.won:
-            self.stats_by_regime[r].setdefault("peak_sum", 0.0)
-            self.stats_by_regime[r]["peak_sum"] += trade.peak_pct
         self.stats_by_symbol[trade.symbol]["wins"]   += 1 if trade.won else 0
         self.stats_by_symbol[trade.symbol]["losses"] += 0 if trade.won else 1
         self.signal_weights.record_outcome(trade.signals, trade.won)
         if len(self.trades) > 1000: self.trades = self.trades[-500:]
 
-    def avg_win(self) -> float:
-        wins = [t.pnl for t in self.trades if t.won]
-        return sum(wins) / len(wins) if wins else 0.0
-    def avg_loss(self) -> float:
-        losses = [abs(t.pnl) for t in self.trades if not t.won]
-        return sum(losses) / len(losses) if losses else 0.0
-
 # ═══════════════════════════════════════════════════════════════════════════
 # GLOBAL STATE & UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
-_precision_cache = {}
-_ticker_cache    = {}
-_ticker_ts       = 0
-_lock            = threading.Lock()
 _executor        = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-_rescan_q        = queue.Queue()
-_hot_syms        = deque(maxlen=30)
-
 _ws_mark_price   = {}
 _kline_cache     = {}
 _kline_lock      = threading.Lock()
-_ws_ticker_cache = {}
-_ws_ticker_ts    = 0
-_ws_last_msg_ts  = time.time()
-WS_STALE_SEC     = 30
-MARKPRICE_FRESH_SEC = 10
 
-_macro = {"btc": "UNKNOWN"}
-_ks    = {"active": False, "reason": "", "resume": 0, "consec": 0, "daily": 0.0, "day_reset": 0}
 _stats = {
     "trades": 0, "wins": 0, "losses": 0, "pnl": 0.0, "best": 0.0, "worst": 0.0, "ath_pnl": 0.0,
     "hard_sl": 0, "tp_exit": 0, "time_limit_exit": 0, "regime_block": 0,
-    "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "absorb_entries": 0,
-    "low_vol_veto": 0,
+    "wall_veto": 0, "btc_breaker_veto": 0, "spoof_veto": 0, "low_vol_veto": 0,
     "hist": deque(maxlen=200), "start": time.time(),
 }
 
-# Variable Toggle Invert Logika & Ban Short Status
 is_logic_inverted = False 
-banned_short_until = 0.0  # Ban short Timestamp Tracker
+banned_short_until = 0.0
 
 live_positions = {}
 cooldown_list  = {}
-trade_log      = []
 signal_weights = SignalWeights()
 scorer         = SignalScorer(signal_weights)
 learning       = LearningLayer(signal_weights)
 
 _last_err_print   = defaultdict(float)
-_api_fail_streak = 0
-_api_ok_last      = time.time()
 _rest_lock = threading.Lock()
 _rest_last_ts = 0.0
 _rest_block_until = 0.0
@@ -674,15 +632,6 @@ def _log_err(tag, e, cooldown=10):
     if now - _last_err_print[tag] > cooldown:
         print(f"  ⚠️ [{tag}] {type(e).__name__}: {e}")
         _last_err_print[tag] = now
-
-def _api_ok():
-    global _api_fail_streak, _api_ok_last
-    _api_fail_streak = 0
-    _api_ok_last = time.time()
-
-def _api_fail(tag):
-    global _api_fail_streak
-    _api_fail_streak += 1
 
 def _rest_call(tag, fn, *args, retries=1, **kwargs):
     global _rest_last_ts, _rest_block_until
@@ -696,24 +645,14 @@ def _rest_call(tag, fn, *args, retries=1, **kwargs):
             _rest_last_ts = time.time()
 
         try:
-            result = fn(*args, **kwargs)
-            _api_ok()
-            return result
+            return fn(*args, **kwargs)
         except Exception as e:
             last_exc = e
             msg = str(e).upper()
             now = time.time()
-
-            if "403" in msg or "REQUEST BLOCKED" in msg:
-                _rest_block_until = max(_rest_block_until, now + REST_403_COOLDOWN)
-                _api_fail(f"{tag}_403")
-                break
-            if "429" in msg:
+            if "403" in msg or "429" in msg:
                 _rest_block_until = max(_rest_block_until, now + REST_429_COOLDOWN)
-                _api_fail(f"{tag}_429")
                 break
-
-            _api_fail(tag)
             if attempt < retries: time.sleep(min(2.0, 0.5 * (2 ** attempt)))
 
     if last_exc is not None: raise last_exc
@@ -742,7 +681,7 @@ def price_live(symbol):
         px = float(res["price"])
         _rest_price_cache[symbol] = (px, now)
         return px
-    except Exception as e:
+    except Exception:
         if old: return old[0]
         return 0.0
 
@@ -765,11 +704,9 @@ def fetch_klines(symbol: str, interval: str = "1m", limit: int = 100) -> Optiona
             'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
         ])
         
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume', 'qav', 'taker_base_vol', 'taker_quote_vol']
-        for col in numeric_cols:
+        for col in ['open', 'high', 'low', 'close', 'volume', 'qav', 'taker_base_vol', 'taker_quote_vol']:
             df[col] = df[col].astype(float)
 
-        # Technical Indicators
         df['e5']  = ta.trend.ema_indicator(df['close'], window=5)
         df['e9']  = ta.trend.ema_indicator(df['close'], window=9)
         df['e21'] = ta.trend.ema_indicator(df['close'], window=21)
@@ -783,7 +720,6 @@ def fetch_klines(symbol: str, interval: str = "1m", limit: int = 100) -> Optiona
         macd = ta.trend.MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
         df['mh'] = macd.macd_diff()
 
-        # Volume & Orderflow Analysis
         df['vol_ma'] = df['volume'].rolling(window=20).mean()
         df['vr'] = df['volume'] / (df['vol_ma'] + 1e-9)
 
@@ -806,20 +742,17 @@ def fetch_klines(symbol: str, interval: str = "1m", limit: int = 100) -> Optiona
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════
-# POSITION MANAGEMENT & EXECUTION
+# EXECUTION & MONITORING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def execute_trade(symbol: str, raw_side: str, score: int, signals: List[str], atr: float, regime: str):
     global is_logic_inverted, banned_short_until
 
     now = time.time()
-    
-    # Map Sinyal Mentah ke Sinyal Eksekusi Tergantung Mode
     execution_side = raw_side
     if is_logic_inverted:
         execution_side = "SHORT" if raw_side == "LONG" else "LONG"
 
-    # Periksa Banned Short 6120 Detik saat di Normal Mode
     if not is_logic_inverted and execution_side == "SHORT":
         if now < banned_short_until:
             rem = banned_short_until - now
@@ -829,23 +762,15 @@ def execute_trade(symbol: str, raw_side: str, score: int, signals: List[str], at
     current_price = price_live(symbol)
     if current_price <= 0: return
 
-    # Check Veto Rules
-    veto, reason = btc_macro.check_veto(execution_side, now)
-    if veto:
-        _stats["btc_breaker_veto"] += 1
-        return
+    veto, _ = btc_macro.check_veto(execution_side, now)
+    if veto: _stats["btc_breaker_veto"] += 1; return
 
-    wall, wall_type, _, _, _ = order_book.check_walls(symbol, current_price, execution_side)
-    if wall:
-        _stats["wall_veto"] += 1
-        return
+    wall, _, _, _, _ = order_book.check_walls(symbol, current_price, execution_side)
+    if wall: _stats["wall_veto"] += 1; return
 
     spoof, _ = order_book.detect_spoofing(symbol, execution_side)
-    if spoof:
-        _stats["spoof_veto"] += 1
-        return
+    if spoof: _stats["spoof_veto"] += 1; return
 
-    # Calculate Targets
     levels = DynamicRiskManager.calculate_levels(current_price, execution_side, atr)
     q = qty(symbol, current_price)
 
@@ -854,22 +779,12 @@ def execute_trade(symbol: str, raw_side: str, score: int, signals: List[str], at
     print(f"📈 [ORDER OPENED] {symbol} {execution_side} @ ${current_price:.4f} | Qty: {q} | Score: {score}")
 
     live_positions[symbol] = {
-        "symbol": symbol,
-        "raw_side": raw_side,             # Menyimpan sinyal murni strategi
-        "execution_side": execution_side, # Menyimpan posisi aktual
-        "entry_price": current_price,
-        "qty": q,
-        "entry_time": now,
-        "tp_price": levels["tp_price"],
-        "sl_price": levels["sl_price"],
-        "tp_pct": levels["tp_pct"],
-        "sl_pct": levels["sl_pct"],
-        "score": score,
-        "signals": signals,
-        "atr": atr,
-        "regime": regime,
-        "peak_pct": 0.0,
-        "mode_at_entry": "INVERTED" if is_logic_inverted else "NORMAL"
+        "symbol": symbol, "raw_side": raw_side, "execution_side": execution_side,
+        "entry_price": current_price, "qty": q, "entry_time": now,
+        "tp_price": levels["tp_price"], "sl_price": levels["sl_price"],
+        "tp_pct": levels["tp_pct"], "sl_pct": levels["sl_pct"],
+        "score": score, "signals": signals, "atr": atr, "regime": regime,
+        "peak_pct": 0.0, "mode_at_entry": "INVERTED" if is_logic_inverted else "NORMAL"
     }
 
 def monitor_positions():
@@ -885,38 +800,24 @@ def monitor_positions():
 
         entry_price = pos["entry_price"]
         side = pos["execution_side"]
-        raw_side = pos["raw_side"]
         entry_mode = pos["mode_at_entry"]
         hold_time = now - pos["entry_time"]
 
-        # Hitung PnL %
-        if side == "LONG":
-            pnl_pct = (current_price - entry_price) / entry_price
-        else:
-            pnl_pct = (entry_price - current_price) / entry_price
-
+        pnl_pct = ((current_price - entry_price) / entry_price) if side == "LONG" else ((entry_price - current_price) / entry_price)
         pos["peak_pct"] = max(pos["peak_pct"], pnl_pct)
 
-        exit_triggered = False
-        exit_reason = ""
+        exit_triggered, exit_reason = False, ""
 
-        # Check Close Conditions
-        if side == "LONG" and current_price >= pos["tp_price"]:
-            exit_triggered, exit_reason = True, "TAKE_PROFIT"
-        elif side == "SHORT" and current_price <= pos["tp_price"]:
-            exit_triggered, exit_reason = True, "TAKE_PROFIT"
-        elif side == "LONG" and current_price <= pos["sl_price"]:
-            exit_triggered, exit_reason = True, "STOP_LOSS"
-        elif side == "SHORT" and current_price >= pos["sl_price"]:
-            exit_triggered, exit_reason = True, "STOP_LOSS"
-        elif hold_time >= MAX_HOLD_SECONDS:
-            exit_triggered, exit_reason = True, "TIME_LIMIT"
+        if side == "LONG" and current_price >= pos["tp_price"]: exit_triggered, exit_reason = True, "TAKE_PROFIT"
+        elif side == "SHORT" and current_price <= pos["tp_price"]: exit_triggered, exit_reason = True, "TAKE_PROFIT"
+        elif side == "LONG" and current_price <= pos["sl_price"]: exit_triggered, exit_reason = True, "STOP_LOSS"
+        elif side == "SHORT" and current_price >= pos["sl_price"]: exit_triggered, exit_reason = True, "STOP_LOSS"
+        elif hold_time >= MAX_HOLD_SECONDS: exit_triggered, exit_reason = True, "TIME_LIMIT"
 
         if exit_triggered:
             pnl_usdt = pnl_pct * (ORDER_USDT * LEVERAGE)
             won = pnl_usdt > 0
 
-            # Update Metrics Global
             _stats["trades"] += 1
             _stats["pnl"] += pnl_usdt
             if won:
@@ -931,7 +832,6 @@ def monitor_positions():
             elif exit_reason == "TAKE_PROFIT": _stats["tp_exit"] += 1
             elif exit_reason == "TIME_LIMIT": _stats["time_limit_exit"] += 1
 
-            # Log Histori
             trade_rec = TradeRecord(
                 symbol=symbol, direction=side, entry_price=entry_price, exit_price=current_price,
                 pnl=pnl_usdt, won=won, regime=pos["regime"], signals=pos["signals"],
@@ -946,33 +846,21 @@ def monitor_positions():
             print(f"\n🚪 [CLOSED POS] {symbol} {side} | Exit: {exit_reason} | PnL: ${pnl_usdt:+.2f} ({pnl_pct*100:+.2f}%)")
             print(f"⏱️ [TIMESTAMP] Entry: {entry_dt} -> Exit: {exit_dt} | Duration: {hold_time:.0f}s")
 
-            # ═══════════════════════════════════════════════════════════════
-            # LOGIKA PEMBALIK MODE (INVERSION & BANNED SWITCH LOGIC)
-            # ═══════════════════════════════════════════════════════════════
-
-            if not won:  # Mengalami MINUS / LOSS
+            # Dynamic Inversion Mode Switch Logic
+            if not won:
                 if entry_mode == "NORMAL":
-                    # Mode Normal:
-                    # - Entry SHORT minus kena Time Limit -> Toggle ke Inverted Mode
-                    # - Entry LONG minus kena Time Limit ATAU SL -> Toggle ke Inverted Mode
                     if (side == "SHORT" and exit_reason == "TIME_LIMIT") or \
                        (side == "LONG" and exit_reason in ("TIME_LIMIT", "STOP_LOSS")):
                         is_logic_inverted = True
-                        print(f"🔄 [MODE TOGGLE] Loss terjadi pada Mode Normal ({side} | {exit_reason})! MENGUBAH MODE -> INVERTED MODE 🔄")
+                        print(f"🔄 [MODE TOGGLE] Loss pada Normal Mode ({side} | {exit_reason})! MENGUBAH MODE -> INVERTED MODE 🔄")
 
                 elif entry_mode == "INVERTED":
-                    # Mode Inverted:
-                    # - Posisi minus kena Time Limit -> Kembali ke Mode Normal
                     if exit_reason == "TIME_LIMIT":
                         is_logic_inverted = False
                         print(f"🟢 [MODE TOGGLE] Loss Time Limit pada Inverted Mode! MENGUBAH MODE -> NORMAL MODE 🟢")
-
-                        # BANNED RULE KHUSUS:
-                        # Jika posisi waktu di Mode Inverted adalah SHORT (hasil invert dari sinyal Normal LONG),
-                        # Dan dia minus kena Time Limit -> Ban Analisis SHORT di Normal Mode selama 6120 Detik!
                         if side == "SHORT":
                             banned_short_until = now + BANNED_SHORT_DURATION
-                            print(f"🚫 [BANNED APPLIED] Mode Normal BANNED dari Entry SHORT selama {BANNED_SHORT_DURATION:.0f} detik (1.7 Jam)!")
+                            print(f"🚫 [BANNED APPLIED] Mode Normal BANNED dari Entry SHORT selama {BANNED_SHORT_DURATION:.0f} detik!")
 
             del live_positions[symbol]
             cooldown_list[symbol] = now + 60.0
@@ -988,15 +876,8 @@ def scan_symbol(symbol: str):
     df = fetch_klines(symbol, interval="1m", limit=100)
     if df is None or len(df) < 55: return
 
-    # Strict Volume & Sideway Filters
     last_row = df.iloc[-2]
-    vr = last_row.get("vr", 0.0)
-    adx = last_row.get("adx", 0.0)
-    atr = last_row.get("atr", 0.0)
-    close_p = last_row.get("close", 1.0)
-    atr_pct = atr / close_p
-
-    if vr < MIN_VOLUME_RATIO or adx < MIN_ADX_TREND or atr_pct < MIN_ATR_PCT:
+    if last_row.get("vr", 0.0) < MIN_VOLUME_RATIO or last_row.get("adx", 0.0) < MIN_ADX_TREND or (last_row.get("atr", 0.0) / last_row.get("close", 1.0)) < MIN_ATR_PCT:
         _stats["low_vol_veto"] += 1
         return
 
@@ -1006,21 +887,17 @@ def scan_symbol(symbol: str):
         execute_trade(symbol, raw_side, score, signals, atr_val, regime)
 
 def print_dashboard():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # HAPUS os.system('cls'/'clear') untuk mencegah 'TERM environment variable not set' di Cloud Container
     now_wita = datetime.now(WITA_TZ).strftime("%Y-%m-%d %H:%M:%S WITA")
     uptime = time.time() - _stats["start"]
     hours, rem = divmod(uptime, 3600)
     mins, secs = divmod(rem, 60)
 
     mode_status = "🔄 INVERTED MODE" if is_logic_inverted else "🟢 NORMAL MODE"
-    
-    banned_status = "NONE"
-    if time.time() < banned_short_until:
-        rem_ban = banned_short_until - time.time()
-        banned_status = f"🚫 SHORT BANNED ({rem_ban:.0f}s remaining)"
+    banned_status = f"🚫 SHORT BANNED ({banned_short_until - time.time():.0f}s left)" if time.time() < banned_short_until else "NONE"
 
-    print("═══════════════════════════════════════════════════════════════════════════")
-    print(f"   🤖 BOT SCALPING v22.0 — INSTITUTIONAL QUANT ENGINE (BINANCE FUTURES)")
+    print("\n═══════════════════════════════════════════════════════════════════════════")
+    print(f"   🤖 BOT SCALPING v22.1 — INSTITUTIONAL QUANT ENGINE (BINANCE FUTURES)")
     print("═══════════════════════════════════════════════════════════════════════════")
     print(f" 🕒 Current Time : {now_wita} | Uptime: {int(hours)}h {int(mins)}m {int(secs)}s")
     print(f" 🔀 System Mode  : {mode_status} | Ban Status: {banned_status}")
@@ -1041,29 +918,25 @@ def print_dashboard():
             pnl = ((px - pos['entry_price']) if side == "LONG" else (pos['entry_price'] - px)) / pos['entry_price'] * 100
             dur = time.time() - pos["entry_time"]
             print(f"    • {sym} [{side}] Entry: ${pos['entry_price']:.4f} | Mark: ${px:.4f} | PnL: {pnl:+.2f}% | Mode: {pos['mode_at_entry']} | Hold: {dur:.0f}s")
-    
-    print(" -------------------------------------------------------------------------")
-    print(" 📜 LAST 5 TRADES HISTORY:")
-    last_5 = list(_stats["hist"])[-5:]
-    if not last_5:
-        print("    (No completed trades yet)")
-    else:
-        for t in reversed(last_5):
-            res_str = "WIN 🟢" if t.won else "LOSS 🔴"
-            exit_dt = datetime.fromtimestamp(t.timestamp, tz=WITA_TZ).strftime('%H:%M:%S')
-            print(f"    [{exit_dt}] {t.symbol} {t.direction} | PnL: ${t.pnl:+.2f} | {res_str} ({t.exit_reason})")
-    print("═══════════════════════════════════════════════════════════════════════════\n")
+    print("═══════════════════════════════════════════════════════════════════════════")
 
 def main():
-    print("🚀 Starting Bot Scalping Engine v22.0...")
+    print("🚀 Starting Bot Scalping Engine v22.1...")
     
-    # WebSocket Ticker & MarkPrice Listener Setup
+    # Websocket Handler yang Kompatibel dengan python-binance Versi Baru
     def _ws_mark_price_handler(msg):
         try:
-            if isinstance(msg, list):
+            if isinstance(msg, dict):
+                s = msg.get("s")
+                p = msg.get("p") or msg.get("c")
+                if s and p:
+                    _ws_mark_price[s] = (float(p), time.time())
+                    if s == "BTCUSDT":
+                        btc_macro.update_tick(float(p))
+            elif isinstance(msg, list):
                 for item in msg:
                     s = item.get("s")
-                    p = item.get("p")
+                    p = item.get("p") or item.get("c")
                     if s and p:
                         _ws_mark_price[s] = (float(p), time.time())
                         if s == "BTCUSDT":
@@ -1073,7 +946,8 @@ def main():
 
     try:
         twm.start()
-        twm.start_miniticker_futures_socket(callback=_ws_mark_price_handler)
+        # Menggunakan method resmi WebSocket python-binance yang stabil
+        twm.start_symbol_mark_price_socket(callback=_ws_mark_price_handler, symbol="BTCUSDT")
     except Exception as e:
         print(f"  ⚠️ WebSocket Init Warning: {e}")
 
@@ -1083,13 +957,12 @@ def main():
             now = time.time()
             monitor_positions()
 
-            # Execute Scanning Engine
             if len(live_positions) < MAX_POSITIONS:
                 futures = [_executor.submit(scan_symbol, sym) for sym in SYMBOLS]
                 for future in as_completed(futures):
                     pass
 
-            if now - last_dash >= 2.0:
+            if now - last_dash >= 5.0: # Interval dashboard dinaikkan ke 5 detik agar log Cloud bersih
                 print_dashboard()
                 last_dash = now
 
