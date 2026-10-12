@@ -1,14 +1,14 @@
 """
-Bot Scalping v22.3 — INSTITUTIONAL QUANT ENGINE (Binance Futures Demo / Testnet)
-================================================================================
-REAL DEMO ORDER EXECUTION & INVERTED DIRECTION LOCK:
-- API Order Execution: Membuka dan menutup posisi secara riil di Binance Futures Testnet API.
-- Volume Filter: Wajib Volume Ratio (VR) >= 0.85 & ADX >= 20 (Cegah Entry Sideway).
-- Direction Lock Mode:
+Bot Scalping v23.0 — BINANCE FUTURES LIVE & DEMO EXECUTION ENGINE
+====================================================================
+FEATURES:
+- Real API Execution (Market Entry + Market Stop Loss + Market Take Profit Order).
+- Switchable Mode: Toggle USE_DEMO_ACCOUNT = True (Testnet) / False (Real Mainnet).
+- Inverted Direction Lock Engine:
   * Loss di NORMAL (LONG)  -> Mode INVERTED DIPAKSA HANYA SHORT sampai Loss.
   * Loss di NORMAL (SHORT) -> Mode INVERTED DIPAKSA HANYA LONG sampai Loss.
   * Loss di INVERTED       -> Kembali ke NORMAL (Arah Bebas Sesuai Sinyal).
-- Same-Side Retry Guard: Melindungi dari perulangan loss berturut-turut pada arah yang sama.
+- Same-Side Retry Guard & Strict Volume/ADX Filter.
 - Real-time Metrics & Timestamp WITA (Makassar UTC+8).
 - MAX_POSITIONS = 1 | ORDER_USDT = 3.0 USDT.
 """
@@ -45,16 +45,18 @@ api_key = os.getenv("API_KEY")
 api_secret = os.getenv("API_SECRET")
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  BINANCE TESTNET / DEMO CONFIGURATION
+#  ACCOUNT CONFIGURATION (PILIH DEMO ATAU REAL)
 # ═══════════════════════════════════════════════════════════════════════════
-PAPER_TRADING = False
-BINANCE_DEMO  = True
+USE_DEMO_ACCOUNT = True  # SET True = Binance Futures Testnet (Demo) | False = Real Binance Mainnet
 
-try:
+if USE_DEMO_ACCOUNT:
+    # Binance Futures Testnet URL
     client = Client(api_key, api_secret, testnet=True)
-except Exception:
-    client = Client(api_key, api_secret)
     client.FUTURES_URL = "https://testnet.binancefuture.com/fapi"
+else:
+    # Binance Futures Real Mainnet URL
+    client = Client(api_key, api_secret)
+    client.FUTURES_URL = "https://fapi.binance.com/fapi"
 
 WS_MAX_QUEUE_SIZE = 2000
 DEPTH_SOCKET_CHUNK = 8
@@ -119,7 +121,7 @@ MIN_TP_PCT        = 0.025
 MAX_TP_PCT        = 0.035
 MIN_SL_PCT        = 0.015
 MAX_SL_PCT        = 0.025
-MAX_HOLD_SECONDS  = 6120   # Batas maksimal tahan posisi (1.7 Jam)
+MAX_HOLD_SECONDS  = 6120   # Batas maksimal tahan posisi (1 jam 42 menit)
 
 # Institutional Order Book
 WALL_RATIO_THRESHOLD  = 2.5
@@ -725,11 +727,11 @@ def _rest_call(tag, fn, *args, retries=1, **kwargs):
     if last_exc is not None: raise last_exc
     raise RuntimeError(f"REST call failed: {tag}")
 
-def get_precision(symbol):
+def get_precision(symbol: str) -> int:
     if symbol in _precision_cache:
         return _precision_cache[symbol]
     try:
-        info = _rest_call("exchange_info", client.futures_exchange_info)
+        info = _rest_call(f"precision_{symbol}", client.futures_exchange_info)
         for s in info["symbols"]:
             if s["symbol"] == symbol:
                 prec = int(s["quantityPrecision"])
@@ -737,17 +739,14 @@ def get_precision(symbol):
                 return prec
     except Exception:
         pass
-    _precision_cache[symbol] = 2
     return 2
 
-def qty(symbol, price):
+def qty(symbol: str, price: float) -> float:
     raw = (ORDER_USDT * LEVERAGE) / price
     p = get_precision(symbol)
-    if p == 0:
-        return float(int(raw))
-    return round(raw, p)
+    return round(raw, p) if p > 0 else math.floor(raw)
 
-def price_live(symbol):
+def price_live(symbol: str) -> float:
     cached = _ws_mark_price.get(symbol)
     if cached:
         px, ts = cached
@@ -887,7 +886,7 @@ def ks_upd(pnl):
     _ks["consec"] = 0 if pnl >= 0 else _ks["consec"] + 1
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  REAL DEMO ENTRY EXECUTION (BINANCE FUTURES API)
+#  REAL API BINANCE EXECUTION ENGINE (OPEN & CLOSE POSITIONS)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_profile):
@@ -896,6 +895,7 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
     if orig_direction not in ("LONG", "SHORT"):
         return
 
+    # Penentuan Eksekusi Aktual
     if is_logic_inverted and _inverted_forced_side:
         execution_side = _inverted_forced_side
     else:
@@ -917,14 +917,15 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         with _lock: live_positions.pop(sym, None)
         return
 
-    # Set Leverage Binance Futures
+    # 1. Set Leverage
     try:
-        _rest_call(f"leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
+        _rest_call(f"set_leverage_{sym}", client.futures_change_leverage, symbol=sym, leverage=LEVERAGE)
     except Exception as e:
-        _log_err(f"leverage_{sym}", e)
+        _log_err(f"set_leverage_{sym}", e)
 
-    # Kirim Order Market Pembukaan Posisi
     order_side = "BUY" if execution_side == "LONG" else "SELL"
+
+    # 2. Eksekusi Market Order ke Binance API
     try:
         order_res = _rest_call(
             f"open_order_{sym}",
@@ -934,18 +935,21 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
             type="MARKET",
             quantity=q_val
         )
-        avg_price = float(order_res.get("avgPrice", price))
-        if avg_price > 0: price = avg_price
+        
+        # Ambil harga eksekusi aktual dari respon Binance
+        avg_price = float(order_res.get("avgPrice", 0.0))
+        if avg_price > 0:
+            price = avg_price
     except Exception as e:
-        _log_err(f"exec_open_{sym}", e)
-        print(f"  ❌ Gagal Eksekusi Order Demo Binance untuk {sym}: {e}")
+        print(f"  ❌ [API ORDER ERROR] Gagal Membuka Posisi {execution_side} pada {sym}: {e}")
         with _lock: live_positions.pop(sym, None)
         return
 
     risk = DynamicRiskManager.calculate_levels(price, execution_side, atr)
     open_ts = time.time()
     entry_mode = "INVERTED" if is_logic_inverted else "NORMAL"
-    
+    acc_label = "TESTNET DEMO" if USE_DEMO_ACCOUNT else "REAL MAINNET"
+
     pos = {
         "side": execution_side,
         "orig_signal": orig_direction,
@@ -963,8 +967,8 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
         "tp_price": risk["tp_price"],
         "sl_price": risk["sl_price"],
         "peak_price": price,
-        "paper": False,
         "mode": entry_mode,
+        "order_id": order_res.get("orderId"),
     }
 
     with _lock:
@@ -972,16 +976,12 @@ def live_open(orig_direction, score, sigs, price, atr, regime, bias, sym, risk_p
 
     d = "🟢" if execution_side == "LONG" else "🔴"
     print(
-        f"\n  {d} [DEMO LIVE ORDER] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{entry_mode}) @{price:.6g} | "
+        f"\n  {d} [API ORDER EXECUTED] [{acc_label}] {sym} EXEC:{execution_side} (Signal:{orig_direction} | Mode:{entry_mode}) @{price:.6g} | "
         f"QTY:{q_val:.8g} | TP:{risk['tp_pct']*100:.2f}% | SL:{risk['sl_pct']*100:.2f}% | In:{pos['open_time_wita']} WITA"
     )
 
     _stats["trades"] += 1
     if any("Absorb" in s for s in sigs): _stats["absorb_entries"] += 1
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  REAL DEMO EXIT EXECUTION (BINANCE FUTURES API)
-# ═══════════════════════════════════════════════════════════════════════════
 
 def live_close(sym, reason, price=None):
     global is_logic_inverted, _last_failed_execution_side, _inverted_forced_side
@@ -994,29 +994,33 @@ def live_close(sym, reason, price=None):
 
     side = pos["side"]
     q_val = pos["qty"]
-    entry = pos["entry"]
-    entry_mode = pos.get("mode", "NORMAL")
+    close_side = "SELL" if side == "LONG" else "BUY"
 
-    # Kirim Order Penutup Posisi (ReduceOnly = True)
-    close_order_side = "SELL" if side == "LONG" else "BUY"
+    # 1. Eksekusi Market Close Order ke Binance API
     try:
         close_res = _rest_call(
             f"close_order_{sym}",
             client.futures_create_order,
             symbol=sym,
-            side=close_order_side,
+            side=close_side,
             type="MARKET",
             quantity=q_val,
             reduceOnly=True
         )
         avg_close_price = float(close_res.get("avgPrice", 0.0))
-        if avg_close_price > 0: price = avg_close_price
+        if avg_close_price > 0:
+            price = avg_close_price
     except Exception as e:
-        _log_err(f"exec_close_{sym}", e)
-        print(f"  ❌ Gagal Menutup Posisi Demo Binance untuk {sym}: {e}")
+        print(f"  ❌ [API CLOSE ERROR] Gagal Tutup Posisi {side} pada {sym}: {e}")
+        # Jika gagal API close, simpan kembali posisi agar di-retry di loop monitor berikutnya
+        with _lock: live_positions[sym] = pos
+        return
 
     if price is None or price <= 0:
         price = price_live(sym)
+
+    entry = pos["entry"]
+    entry_mode = pos.get("mode", "NORMAL")
 
     gross_pnl = (price - entry) * q_val if side == "LONG" else (entry - price) * q_val
     fee_rate = 0.0005
@@ -1032,16 +1036,19 @@ def live_close(sym, reason, price=None):
     close_wita = datetime.fromtimestamp(close_ts, tz=WITA_TZ).strftime("%H:%M:%S")
     open_wita = pos.get("open_time_wita", datetime.fromtimestamp(pos["open_time"], tz=WITA_TZ).strftime("%H:%M:%S"))
 
-    if not won:  
+    # ═══════════════════════════════════════════════════════════════════════════
+    #  LOGIKA INVERTED DIRECTION LOCK & TOGGLE
+    # ═══════════════════════════════════════════════════════════════════════════
+    if not won:  # Loss (SL atau TIME_LIMIT pnl < 0)
         _last_failed_execution_side = side
 
         if not is_logic_inverted:
             is_logic_inverted = True
-            _inverted_forced_side = "SHORT" if side == "LONG" else "LONG" 
+            _inverted_forced_side = "SHORT" if side == "LONG" else "LONG"
             print(f"  🔄 [MODE CHANGE] Posisi NORMAL {side} LOSS ({pnl:+.4f}U)! Pindah ke INVERTED — KUNCI arah eksekusi ke: {_inverted_forced_side}")
         else:
             is_logic_inverted = False
-            _inverted_forced_side = None 
+            _inverted_forced_side = None
             print(f"  🔄 [MODE CHANGE] Posisi INVERTED {side} LOSS ({pnl:+.4f}U)! Pindah ke NORMAL — Arah Bebas Sesuai Sinyal.")
     else:
         _last_failed_execution_side = None
@@ -1050,7 +1057,7 @@ def live_close(sym, reason, price=None):
         print(f"  ✅ [LOGIC STABLE] Posisi {side} PROFIT ({pnl:+.4f}U)! Mode Tetap: {current_mode}{forced_str}")
 
     print(
-        f"  {e_icon} [DEMO EXIT] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
+        f"  {e_icon} [API EXIT CLOSED] {sym} {side} CLOSE [{entry_mode}] — {reason} | "
         f"{entry:.6g}→{price:.6g} ({pct:+.3f}%) hold:{hold:.0f}s | PnL:{pnl:+.5f}U | Out:{close_wita} WITA"
     )
 
@@ -1157,7 +1164,7 @@ def scan_one(sym):
         if is_logic_inverted and _inverted_forced_side:
             opposite_needed = "LONG" if _inverted_forced_side == "SHORT" else "SHORT"
             if orig_direction != opposite_needed:
-                return None  
+                return None
             execution_side = _inverted_forced_side
         else:
             execution_side = orig_direction
@@ -1171,7 +1178,7 @@ def scan_one(sym):
 
             if score < required_score or adx_val < 25.0 or not trend_aligned:
                 _stats["same_side_veto"] += 1
-                return None  
+                return None  # VETO
 
         px_live = price_live(sym)
         if px_live == 0: return None
@@ -1225,7 +1232,8 @@ def print_inline():
     mode_str = "INVERTED" if is_logic_inverted else "NORMAL"
     forced_str = f"({_inverted_forced_side})" if _inverted_forced_side else ""
     failed_str = f"| SameSideLock:{_last_failed_execution_side}" if _last_failed_execution_side else ""
-    print(f"       ┌ [BINANCE DEMO ENGINE v23.0 - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
+    acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
+    print(f"       ┌ [API ENGINE v23.0 ({acc_mode}) - MODE: {mode_str}{forced_str}] {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']} PnL:{pnl:+.4f}U {failed_str}")
     print(f"       └ TP:{_stats['tp_exit']} SL:{_stats['hard_sl']} TIME_LIMIT:{_stats['time_limit_exit']} | VolVeto:{_stats['low_vol_veto']} | SameSideVeto:{_stats['same_side_veto']}")
 
 def print_full():
@@ -1236,9 +1244,10 @@ def print_full():
     forced_str = f" [{_inverted_forced_side} ONLY]" if _inverted_forced_side else ""
     now_wita = datetime.now(tz=WITA_TZ).strftime("%H:%M:%S WITA")
     failed_str = f" [SAME-SIDE GUARD ACTIVE: {_last_failed_execution_side}]" if _last_failed_execution_side else ""
+    acc_mode = "DEMO TESTNET" if USE_DEMO_ACCOUNT else "REAL MAINNET"
     
     print(f"\n  {'─'*72}")
-    print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD (MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
+    print(f"    🔔 INSTITUTIONAL SCALPING DASHBOARD ({acc_mode} | MODE: {mode_str}{forced_str}){failed_str} [{now_wita}]")
     print(f"    🎯 {n}T WR:{wr:.0f}% W:{_stats['wins']} L:{_stats['losses']}")
     print(f"    PnL Net:{pnl:+.5f}U | ATH PnL:{_stats['ath_pnl']:+.5f}U")
     print(f"    🏆 Best Win:{_stats['best']:+.5f}U | 💥 Worst Loss:{_stats['worst']:+.5f}U")
@@ -1387,14 +1396,16 @@ def handle_depth_multiplex(msg):
         if isinstance(data, dict) and data.get("s"):
             order_book.update(data["s"], data.get("b", []), data.get("a", []))
     except Exception as e:
-        _log_err("handle_depth_multiplex", e)
+        _log_err(f"handle_depth_multiplex", e)
 
 def run_bot():
+    acc_type_str = "BINANCE FUTURES DEMO (TESTNET)" if USE_DEMO_ACCOUNT else "BINANCE FUTURES REAL MAINNET"
     print("╔════════════════════════════════════════════════════════════════════╗")
-    print("║  💎 BOT SCALPING v23.0 LIVE — BINANCE FUTURES DEMO/TESTNET API     ║")
-    print("║  1. Mode Eksekusi: REAL DEMO ORDER (Binance Testnet API)           ║")
+    print(f"║  💎 BOT SCALPING v23.0 — LIVE BINANCE API EXECUTION ENGINE         ║")
+    print(f"║  MODE AKUN: {acc_type_str:<51} ║")
+    print("║  1. Mode Awal: NORMAL (Arah Bebas Sesuai Sinyal Indikator)         ║")
     print("║  2. Strict Filter: Volume Ratio >= 0.85 & ADX >= 20 (Anti-Sideway) ║")
-    print("║  3. Mode Inverted Lock:                                            ║")
+    print("║  3. Inverted Lock Engine:                                          ║")
     print("║     * Loss di NORMAL (LONG)  -> DIPAKSA SHORT SAMPAI LOSS          ║")
     print("║     * Loss di NORMAL (SHORT) -> DIPAKSA LONG SAMPAI LOSS           ║")
     print("║  4. Margin = $3.0 | Max Position = 1 | Timestamp WITA (Makassar)   ║")
@@ -1404,7 +1415,7 @@ def run_bot():
         info = _rest_call("startup_exchange_info", client.futures_exchange_info, retries=0)
         valid = {s["symbol"] for s in info["symbols"] if s["status"] == "TRADING"}
     except Exception as e:
-        raise RuntimeError(f"Gagal membaca exchangeInfo dari Binance Testnet: {e}")
+        raise RuntimeError(f"Gagal membaca exchangeInfo dari API Binance ({acc_type_str}): {e}")
 
     syms = list(dict.fromkeys([s for s in SYMBOLS if s in valid]))
 
@@ -1441,7 +1452,7 @@ def run_bot():
 
         if (k := ks_check())[0]: print(f"  🚨 KS:{k[1]}")
         elif slots == 0: print(f"  ✅ Slots Full — Monitoring Posisi Terbuka")
-        else: print(f"  🔍 Slot Kosong — Scanning Signal (Mode: {mode_str}{forced_str})...")
+        else: print(f"  🔍 Slot Kosong — Scanning Signal ({'DEMO' if USE_DEMO_ACCOUNT else 'REAL'} | Mode: {mode_str}{forced_str})...")
         if cycle % 30 == 0: print_full()
         time.sleep(SCAN_INTERVAL)
 
