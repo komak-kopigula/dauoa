@@ -89,7 +89,7 @@ twm = _create_twm()
 # ═══════════════════════════════════════════════════════════════════════════
 
 LEVERAGE      = 20
-ORDER_USDT    = 3.0
+ORDER_USDT    = 2.0
 MAX_POSITIONS = 1
 
 # Strict Volume & Sideway Filters
